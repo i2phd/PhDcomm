@@ -274,7 +274,8 @@ int encode_data_with_fec(robust_dpsk_system_t *sys, uint8_t *input_data, int inp
                 output_bits[output_pos++] = conv_output[1];
             }
         }
-        for (int i = 0; i < CONV_K - 1; i++) {
+        // Flush convoluzionale with enough bits for Viterbi traceback
+        for (int i = 0; i < VITERBI_TRACEBACK - 1; i++) {
             if (output_pos + 1 >= max_output_bits) break;
             uint8_t conv_output[2];
             conv_encode_bit(&sys->conv_enc, 0, conv_output);
