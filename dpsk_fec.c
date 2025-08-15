@@ -24,7 +24,7 @@
 #define CONV_RATE_DEN 2
 #define CONV_STATES (1 << (CONV_K-1))
 #define CONV_OUTPUTS 2
-#define VITERBI_TRACEBACK 44
+#define VITERBI_TRACEBACK 64
 
 // Reed-Solomon parameters from LLVM implementation
 #define mm 8
@@ -60,15 +60,11 @@ typedef struct {
 
 typedef struct {
     uint32_t metric;
-    uint64_t path;
 } viterbi_node_t;
 
 typedef struct {
     viterbi_node_t states[CONV_STATES];
     viterbi_node_t next_states[CONV_STATES];
-    uint8_t *traceback_buffer;
-    int traceback_pos;
-    uint32_t *path_memory;
 } viterbi_decoder_t;
 
 typedef struct {
@@ -146,38 +142,46 @@ uint8_t hamming_distance(uint8_t a, uint8_t b) {
 }
 viterbi_decoder_t* viterbi_decoder_init() {
     viterbi_decoder_t *dec = malloc(sizeof(viterbi_decoder_t));
-    for (int i = 0; i < CONV_STATES; i++) { dec->states[i].metric = (i == 0) ? 0 : 0xFFFFFFFF; dec->states[i].path = 0; }
-    dec->traceback_buffer = calloc(VITERBI_TRACEBACK * CONV_STATES, sizeof(uint8_t));
-    dec->path_memory = calloc(VITERBI_TRACEBACK, sizeof(uint32_t));
-    dec->traceback_pos = 0;
+    for (int i = 0; i < CONV_STATES; i++) { dec->states[i].metric = (i == 0) ? 0 : 0xFFFFFFFF; }
     return dec;
 }
-void viterbi_decoder_free(viterbi_decoder_t *dec) { if (dec) { free(dec->traceback_buffer); free(dec->path_memory); free(dec); } }
-uint8_t viterbi_decode_bit(viterbi_decoder_t *dec, uint8_t received_bits[2]) {
-    for (int i = 0; i < CONV_STATES; i++) { dec->next_states[i].metric = 0xFFFFFFFF; dec->next_states[i].path = 0; }
+void viterbi_decoder_free(viterbi_decoder_t *dec) { if (dec) { free(dec); } }
+void viterbi_update_trellis(viterbi_decoder_t *dec, uint8_t received_bits[2], uint16_t *trellis_column) {
+    for (int i = 0; i < CONV_STATES; i++) { dec->next_states[i].metric = 0xFFFFFFFF; }
+
     for (int current_state = 0; current_state < CONV_STATES; current_state++) {
         if (dec->states[current_state].metric == 0xFFFFFFFF) continue;
+
         for (uint8_t input_bit = 0; input_bit < 2; input_bit++) {
             int next_state = ((current_state << 1) | input_bit) & (CONV_STATES - 1);
+
             conv_encoder_t temp_enc = { .state = current_state, .poly1 = CONV_POLY_1, .poly2 = CONV_POLY_2 };
             uint8_t expected_bits[2];
             conv_encode_bit(&temp_enc, input_bit, expected_bits);
             uint8_t branch_metric = hamming_distance((received_bits[0] << 1) | received_bits[1], (expected_bits[0] << 1) | expected_bits[1]);
             uint32_t new_metric = dec->states[current_state].metric + branch_metric;
+
             if (new_metric < dec->next_states[next_state].metric) {
                 dec->next_states[next_state].metric = new_metric;
-                dec->next_states[next_state].path = (dec->states[current_state].path << 1) | input_bit;
+                trellis_column[next_state] = current_state;
             }
         }
     }
     memcpy(dec->states, dec->next_states, sizeof(dec->states));
-    if (dec->traceback_pos >= VITERBI_TRACEBACK) {
-        int best_state = 0;
-        for (int i = 1; i < CONV_STATES; i++) { if (dec->states[i].metric < dec->states[best_state].metric) best_state = i; }
-        return (dec->states[best_state].path >> (VITERBI_TRACEBACK - 1)) & 1;
+}
+
+void viterbi_traceback(viterbi_decoder_t *dec, uint16_t *trellis, int num_bits, uint8_t *decoded_bits) {
+    int best_state = 0;
+    for (int i = 1; i < CONV_STATES; i++) {
+        if (dec->states[i].metric < dec->states[best_state].metric) {
+            best_state = i;
+        }
     }
-    dec->traceback_pos++;
-    return 0;
+
+    for (int i = num_bits; i > 0; i--) {
+        decoded_bits[i-1] = best_state & 1;
+        best_state = trellis[(i-1) * CONV_STATES + best_state];
+    }
 }
 
 // ============ REED-SOLOMON (LLVM IMPLEMENTATION) ============
@@ -291,15 +295,15 @@ int decode_data_with_fec(robust_dpsk_system_t *sys, uint8_t *input_bits, int inp
     int output_pos = 0;
     printf("Decoding %d bit ricevuti...\n", input_len);
     scrambler_init(&sys->scrambler, SCRAMBLER_INIT, SCRAMBLER_POLY);
-    uint8_t *raw_viterbi_output = malloc(input_len / 2);
-    int viterbi_pos = 0;
-    for (int i = 0; i < input_len - 1; i += 2) {
-        uint8_t received_bits[2] = {input_bits[i], input_bits[i+1]};
-        uint8_t decoded_bit = viterbi_decode_bit(sys->viterbi_dec, received_bits);
-        if (viterbi_pos < input_len / 2) { raw_viterbi_output[viterbi_pos++] = decoded_bit; }
+    int num_columns = input_len / 2;
+    uint16_t *trellis = calloc(CONV_STATES * num_columns, sizeof(uint16_t));
+    for (int i = 0; i < num_columns; i++) {
+        viterbi_update_trellis(sys->viterbi_dec, &input_bits[i * 2], &trellis[i * CONV_STATES]);
     }
-    uint8_t *viterbi_output = &raw_viterbi_output[VITERBI_TRACEBACK - 1];
-    int viterbi_len = viterbi_pos - (VITERBI_TRACEBACK - 1);
+    uint8_t *viterbi_output = malloc(num_columns);
+    viterbi_traceback(sys->viterbi_dec, trellis, num_columns, viterbi_output);
+    free(trellis);
+    int viterbi_len = num_columns;
     if (viterbi_len < 0) viterbi_len = 0;
     int byte_count = viterbi_len / 8;
     uint8_t *rs_input = malloc(byte_count);
@@ -332,14 +336,116 @@ int decode_data_with_fec(robust_dpsk_system_t *sys, uint8_t *input_bits, int inp
             }
         }
     }
-    free(raw_viterbi_output);
+    free(viterbi_output);
     free(rs_input);
     printf("Decoded: %d byte output da %d bit input\n", output_pos, input_len);
     return output_pos;
 }
 
+int test_scrambler() {
+    printf("\n====== Inizio Test Scrambler ======\n");
+    scrambler_t scrambler, descrambler;
+    scrambler_init(&scrambler, SCRAMBLER_INIT, SCRAMBLER_POLY);
+    scrambler_init(&descrambler, SCRAMBLER_INIT, SCRAMBLER_POLY);
+
+    uint8_t original_data[100];
+    uint8_t scrambled_data[100];
+    uint8_t descrambled_data[100];
+
+    for (int i = 0; i < 100; i++) {
+        original_data[i] = i;
+    }
+
+    for (int i = 0; i < 100; i++) {
+        scrambled_data[i] = scramble_byte(&scrambler, original_data[i]);
+    }
+
+    for (int i = 0; i < 100; i++) {
+        descrambled_data[i] = scramble_byte(&descrambler, scrambled_data[i]);
+    }
+
+    int success = 1;
+    for (int i = 0; i < 100; i++) {
+        if (original_data[i] != descrambled_data[i]) {
+            printf("Errore di verifica alla posizione %d: atteso %02X, ottenuto %02X\n", i, original_data[i], descrambled_data[i]);
+            success = 0;
+        }
+    }
+
+    if (success) {
+        printf("====== Test Scrambler PASSATO! ======\n");
+    } else {
+        printf("====== Test Scrambler FALLITO! ======\n");
+    }
+    return success ? 0 : 1;
+}
+
+int test_convolutional_coder() {
+    printf("\n====== Inizio Test Coder Convoluzionale ======\n");
+    conv_encoder_t encoder;
+    conv_encoder_init(&encoder);
+    viterbi_decoder_t *decoder = viterbi_decoder_init();
+
+    int num_bits = 1000;
+    int num_columns = num_bits + VITERBI_TRACEBACK - 1;
+    uint8_t original_bits[num_bits];
+    uint8_t encoded_bits[num_columns * 2];
+    uint8_t decoded_bits[num_columns];
+
+    for (int i = 0; i < num_bits; i++) {
+        original_bits[i] = rand() % 2;
+    }
+
+    for (int i = 0; i < num_bits; i++) {
+        conv_encode_bit(&encoder, original_bits[i], &encoded_bits[i * 2]);
+    }
+    // Flush the encoder
+    for (int i = 0; i < VITERBI_TRACEBACK - 1; i++) {
+        conv_encode_bit(&encoder, 0, &encoded_bits[(num_bits + i) * 2]);
+    }
+
+    // Introduce some errors
+    int num_errors = 10;
+    printf("Introdotti %d errori di bit.\n", num_errors);
+    for (int i = 0; i < num_errors; i++) {
+        int loc = rand() % (num_bits * 2);
+        encoded_bits[loc] ^= 1;
+    }
+
+    uint16_t *trellis = calloc(CONV_STATES * num_columns, sizeof(uint16_t));
+
+    for (int i = 0; i < num_columns; i++) {
+        viterbi_update_trellis(decoder, &encoded_bits[i * 2], &trellis[i * CONV_STATES]);
+    }
+
+    viterbi_traceback(decoder, trellis, num_columns, decoded_bits);
+
+    int success = 1;
+    for (int i = 0; i < num_bits; i++) {
+        if (original_bits[i] != decoded_bits[i]) {
+            printf("Errore di verifica al bit %d: atteso %d, ottenuto %d\n", i, original_bits[i], decoded_bits[i]);
+            success = 0;
+        }
+    }
+
+    if (success) {
+        printf("====== Test Coder Convoluzionale PASSATO! ======\n");
+    } else {
+        printf("====== Test Coder Convoluzionale FALLITO! ======\n");
+    }
+
+    free(trellis);
+    viterbi_decoder_free(decoder);
+    return success ? 0 : 1;
+}
+
 int main() {
-    printf("====== Inizio Test Completo FEC (Scrambling, RS, Conv) ======\n");
+    int fec_test_result, scrambler_test_result, conv_test_result;
+
+    scrambler_test_result = test_scrambler();
+    conv_test_result = test_convolutional_coder();
+
+    printf("\n====== Inizio Test Completo FEC (Scrambling, RS, Conv) ======\n");
     robust_dpsk_system_t *sys = system_init(1);
     if (!sys) { printf("Errore: impossibile inizializzare il sistema.\n"); return 1; }
     uint8_t original_data[RS_K];
@@ -376,5 +482,7 @@ int main() {
     else { printf("\n====== Test FEC Completo FALLITO! ======\n"); }
     free(encoded_bits);
     system_free(sys);
-    return success ? 0 : 1;
+    fec_test_result = success ? 0 : 1;
+
+    return (fec_test_result || scrambler_test_result || conv_test_result);
 }
