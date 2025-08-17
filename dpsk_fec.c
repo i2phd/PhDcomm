@@ -266,8 +266,10 @@ int encode_data_with_fec(robust_dpsk_system_t *sys, uint8_t *input_data, int inp
         uint8_t rs_input[RS_K];
         uint8_t rs_codeword[RS_N];
         memset(rs_input, 0, RS_K);
-        for (int i = 0; i < block_len; i++) { rs_input[i] = scramble_byte(&sys->scrambler, input_data[block_start + i]); }
+        memcpy(rs_input, &input_data[block_start], block_len);
+
         rs_encode(rs_input, RS_K, rs_codeword);
+
         conv_encoder_init(&sys->conv_enc);
         for (int i = 0; i < RS_N; i++) {
             for (int bit = 0; bit < 8; bit++) {
@@ -275,18 +277,17 @@ int encode_data_with_fec(robust_dpsk_system_t *sys, uint8_t *input_data, int inp
                 uint8_t input_bit = (rs_codeword[i] >> bit) & 1;
                 uint8_t conv_output[2];
                 conv_encode_bit(&sys->conv_enc, input_bit, conv_output);
-                output_bits[output_pos++] = conv_output[0];
-                output_bits[output_pos++] = conv_output[1];
+
+                // Scramble the bits
+                uint8_t scrambled_bits[2];
+                scrambled_bits[0] = conv_output[0] ^ scrambler_next_bit(&sys->scrambler);
+                scrambled_bits[1] = conv_output[1] ^ scrambler_next_bit(&sys->scrambler);
+
+                output_bits[output_pos++] = scrambled_bits[0];
+                output_bits[output_pos++] = scrambled_bits[1];
             }
         }
-        // Flush convoluzionale with enough bits for Viterbi traceback
-        for (int i = 0; i < VITERBI_TRACEBACK - 1; i++) {
-            if (output_pos + 1 >= max_output_bits) break;
-            uint8_t conv_output[2];
-            conv_encode_bit(&sys->conv_enc, 0, conv_output);
-            output_bits[output_pos++] = conv_output[0];
-            output_bits[output_pos++] = conv_output[1];
-        }
+        // No flushing here, it's done in the convolutional encoder test
     }
     printf("Encoded: %d bit output da %d byte input\n", output_pos, input_len);
     return output_pos;
@@ -296,10 +297,15 @@ int decode_data_with_fec(robust_dpsk_system_t *sys, uint8_t *input_bits, int inp
     int output_pos = 0;
     printf("Decoding %d bit ricevuti...\n", input_len);
     scrambler_init(&sys->scrambler, SCRAMBLER_INIT, SCRAMBLER_POLY);
+    uint8_t descrambled_bits[input_len];
+    for (int i=0; i<input_len; i++) {
+        descrambled_bits[i] = input_bits[i] ^ scrambler_next_bit(&sys->scrambler);
+    }
+
     int num_columns = input_len / 2;
     uint16_t *trellis = calloc(CONV_STATES * num_columns, sizeof(uint16_t));
     for (int i = 0; i < num_columns; i++) {
-        viterbi_update_trellis(sys->viterbi_dec, &input_bits[i * 2], &trellis[i * CONV_STATES]);
+        viterbi_update_trellis(sys->viterbi_dec, &descrambled_bits[i * 2], &trellis[i * CONV_STATES]);
     }
     uint8_t *viterbi_output = malloc(num_columns);
     viterbi_traceback(sys->viterbi_dec, trellis, num_columns, viterbi_output);
@@ -326,14 +332,14 @@ int decode_data_with_fec(robust_dpsk_system_t *sys, uint8_t *input_bits, int inp
                 (*corrected_blocks)++;
             }
             for (int i = 0; i < RS_K && output_pos < max_output_len; i++) {
-                output_data[output_pos++] = scramble_byte(&sys->scrambler, codeword[i]);
+                output_data[output_pos++] = codeword[i];
             }
         } else { // -1 for uncorrectable errors
             printf("Errore Reed-Solomon non correggibile nel blocco %d\n", block);
             (*uncorrectable_blocks)++;
             // Even with uncorrectable errors, we might still want to output the data
             for (int i = 0; i < RS_K && output_pos < max_output_len; i++) {
-                output_data[output_pos++] = scramble_byte(&sys->scrambler, codeword[i]);
+                output_data[output_pos++] = codeword[i];
             }
         }
     }
