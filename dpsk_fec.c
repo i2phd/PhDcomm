@@ -4,7 +4,7 @@
 #include <string.h>
 #include <complex.h>
 #include <stdint.h>
-#include "rs_llvm.h"
+#include "reedsolomon.h"
 
 #define SAMPLE_RATE 48000
 #define CARRIER_FREQ 480
@@ -184,19 +184,20 @@ void viterbi_traceback(viterbi_decoder_t *dec, uint16_t *trellis, int num_bits, 
     }
 }
 
-// ============ REED-SOLOMON (LLVM IMPLEMENTATION) ============
-void rs_init() { generate_gf(); gen_poly(); }
-void rs_encode(uint8_t *data_in, uint8_t *codeword) {
-    for (int i = 0; i < kk; i++) { data[i] = data_in[i]; }
-    encode_rs();
-    memcpy(codeword, data_in, kk);
-    for (int i = 0; i < (nn - kk); i++) { codeword[kk + i] = bb[i]; }
+// ============ REED-SOLOMON ============
+void rs_init() {
+    init_galois_tables();
+    initialize_ecc(NPAR);
 }
-int rs_decode(uint8_t *codeword) {
-    for (int i = 0; i < nn; i++) { recd[i] = index_of[codeword[i]]; }
-    int result = decode_rs();
-    for (int i = 0; i < nn; i++) { codeword[i] = recd[i]; }
-    return result;
+void rs_encode(uint8_t *data_in, int nbytes, uint8_t *codeword) {
+    encode_data(data_in, nbytes, codeword);
+}
+int rs_decode(uint8_t *codeword, int nbytes) {
+    decode_data(codeword, nbytes);
+    if (check_syndrome() != 0) {
+        return correct_errors_erasures(codeword, nbytes, 0, NULL);
+    }
+    return 1; // No errors
 }
 
 // ============ SISTEMA PRINCIPALE ============
@@ -266,7 +267,7 @@ int encode_data_with_fec(robust_dpsk_system_t *sys, uint8_t *input_data, int inp
         uint8_t rs_codeword[RS_N];
         memset(rs_input, 0, RS_K);
         for (int i = 0; i < block_len; i++) { rs_input[i] = scramble_byte(&sys->scrambler, input_data[block_start + i]); }
-        rs_encode(rs_input, rs_codeword);
+        rs_encode(rs_input, RS_K, rs_codeword);
         conv_encoder_init(&sys->conv_enc);
         for (int i = 0; i < RS_N; i++) {
             for (int bit = 0; bit < 8; bit++) {
@@ -318,7 +319,7 @@ int decode_data_with_fec(robust_dpsk_system_t *sys, uint8_t *input_bits, int inp
     *uncorrectable_blocks = 0;
     for (int block = 0; block < rs_blocks; block++) {
         uint8_t *codeword = &rs_input[block * RS_N];
-        int rs_result = rs_decode(codeword);
+        int rs_result = rs_decode(codeword, RS_N);
         if (rs_result >= 0) { // 0 for no errors, 1 for corrected errors
             if (rs_result == 1) {
                 printf("Blocco %d: errori correggibili trovati e corretti.\n", block);
@@ -439,11 +440,119 @@ int test_convolutional_coder() {
     return success ? 0 : 1;
 }
 
+int test_custom_fec_chain() {
+    printf("\n====== Inizio Test Catena FEC Custom ======\n");
+    int num_bytes = 64; // 512 bits
+    uint8_t original_data[num_bytes];
+    for (int i = 0; i < num_bytes; i++) {
+        original_data[i] = rand() % 256;
+    }
+
+    // 1. RS encode
+    uint8_t rs_codeword[num_bytes + NPAR];
+    rs_encode(original_data, num_bytes, rs_codeword);
+
+    // 2. Convolutional encode
+    conv_encoder_t conv_enc;
+    conv_encoder_init(&conv_enc);
+    int conv_input_len_bits = (num_bytes + NPAR) * 8;
+    int conv_output_len_bits_unpadded = (conv_input_len_bits + VITERBI_TRACEBACK - 1) * 2;
+    int conv_output_len_bits = (conv_output_len_bits_unpadded + 7) & ~7; // Align to 8 bits
+    uint8_t conv_output_bits[conv_output_len_bits];
+    memset(conv_output_bits, 0, conv_output_len_bits);
+
+    for (int i = 0; i < (num_bytes + NPAR); i++) {
+        for (int bit = 0; bit < 8; bit++) {
+            uint8_t input_bit = (rs_codeword[i] >> bit) & 1;
+            conv_encode_bit(&conv_enc, input_bit, &conv_output_bits[(i * 8 + bit) * 2]);
+        }
+    }
+    for (int i = 0; i < VITERBI_TRACEBACK - 1; i++) {
+        conv_encode_bit(&conv_enc, 0, &conv_output_bits[(conv_input_len_bits + i) * 2]);
+    }
+
+    // 3. Scramble
+    scrambler_t scrambler;
+    scrambler_init(&scrambler, SCRAMBLER_INIT, SCRAMBLER_POLY);
+    int scrambled_len_bytes = conv_output_len_bits / 8;
+    uint8_t scrambled_data[scrambled_len_bytes];
+    for (int i = 0; i < scrambled_len_bytes; i++) {
+        uint8_t byte = 0;
+        for (int bit = 0; bit < 8; bit++) {
+            byte |= conv_output_bits[i * 8 + bit] << bit;
+        }
+        scrambled_data[i] = scramble_byte(&scrambler, byte);
+    }
+
+    // 4. Introduce errors
+    int num_errors = 20;
+    printf("Introdotti %d errori di bit.\n", num_errors);
+    for (int i = 0; i < num_errors; i++) {
+        int byte_loc = rand() % scrambled_len_bytes;
+        int bit_loc = rand() % 8;
+        scrambled_data[byte_loc] ^= (1 << bit_loc);
+    }
+
+    // 5. Descramble
+    scrambler_init(&scrambler, SCRAMBLER_INIT, SCRAMBLER_POLY);
+    uint8_t descrambled_data[scrambled_len_bytes];
+    for (int i = 0; i < scrambled_len_bytes; i++) {
+        descrambled_data[i] = scramble_byte(&scrambler, scrambled_data[i]);
+    }
+
+    // 6. Convolutional decode
+    viterbi_decoder_t *viterbi_dec = viterbi_decoder_init();
+    int num_columns = conv_output_len_bits / 2;
+    uint16_t *trellis = calloc(CONV_STATES * num_columns, sizeof(uint16_t));
+    uint8_t conv_decoded_bits[num_columns];
+    for (int i = 0; i < num_columns; i++) {
+        uint8_t received_bits[2];
+        int bit_idx0 = i * 2;
+        int bit_idx1 = i * 2 + 1;
+        received_bits[0] = (descrambled_data[bit_idx0 / 8] >> (bit_idx0 % 8)) & 1;
+        received_bits[1] = (descrambled_data[bit_idx1 / 8] >> (bit_idx1 % 8)) & 1;
+
+        viterbi_update_trellis(viterbi_dec, received_bits, &trellis[i * CONV_STATES]);
+    }
+    viterbi_traceback(viterbi_dec, trellis, num_columns, conv_decoded_bits);
+    free(trellis);
+    viterbi_decoder_free(viterbi_dec);
+
+    // 7. RS decode
+    uint8_t rs_decoded_codeword[num_bytes + NPAR];
+    for (int i = 0; i < (num_bytes + NPAR); i++) {
+        uint8_t byte = 0;
+        for (int bit = 0; bit < 8; bit++) {
+            byte |= conv_decoded_bits[i * 8 + bit] << bit;
+        }
+        rs_decoded_codeword[i] = byte;
+    }
+    rs_decode(rs_decoded_codeword, num_bytes + NPAR);
+
+    // 8. Compare
+    int success = 1;
+    for (int i = 0; i < num_bytes; i++) {
+        if (original_data[i] != rs_decoded_codeword[i]) {
+            printf("Errore di verifica al byte %d: atteso %02X, ottenuto %02X\n", i, original_data[i], rs_decoded_codeword[i]);
+            success = 0;
+        }
+    }
+
+    if (success) {
+        printf("====== Test Catena FEC Custom PASSATO! ======\n");
+    } else {
+        printf("====== Test Catena FEC Custom FALLITO! ======\n");
+    }
+    return success ? 0 : 1;
+}
+
 int main() {
     int fec_test_result, scrambler_test_result, conv_test_result;
 
     scrambler_test_result = test_scrambler();
     conv_test_result = test_convolutional_coder();
+
+    int custom_fec_test_result = test_custom_fec_chain();
 
     printf("\n====== Inizio Test Completo FEC (Scrambling, RS, Conv) ======\n");
     robust_dpsk_system_t *sys = system_init(1);
@@ -484,5 +593,5 @@ int main() {
     system_free(sys);
     fec_test_result = success ? 0 : 1;
 
-    return (fec_test_result || scrambler_test_result || conv_test_result);
+    return (fec_test_result || scrambler_test_result || conv_test_result || custom_fec_test_result);
 }
