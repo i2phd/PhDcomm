@@ -5,6 +5,7 @@
 #include <complex.h>
 #include <stdint.h>
 #include "reedsolomon.h"
+#include "fft-complex.h"
 
 #define SAMPLE_RATE 48000
 #define CARRIER_FREQ 480
@@ -88,6 +89,9 @@ typedef struct {
     double phase_ref;
     int symbol_start;
     int is_synchronized;
+    double complex *preamble_samples;
+    int preamble_len;
+    int sync_pos;
     double quality_metric;
     pll_t carrier_pll;
     iir_filter_t *lpf_i, *lpf_q;
@@ -201,6 +205,56 @@ int rs_decode(uint8_t *codeword, int nbytes) {
 }
 
 // ============ SISTEMA PRINCIPALE ============
+int correlate(double complex *signal, int signal_len, double complex *preamble, int preamble_len) {
+    int n = 1;
+    while (n < signal_len + preamble_len - 1) {
+        n *= 2;
+    }
+
+    double complex *signal_padded = calloc(n, sizeof(double complex));
+    double complex *preamble_padded = calloc(n, sizeof(double complex));
+    memcpy(signal_padded, signal, signal_len * sizeof(double complex));
+    memcpy(preamble_padded, preamble, preamble_len * sizeof(double complex));
+
+    Fft_transform(signal_padded, n, false);
+    Fft_transform(preamble_padded, n, false);
+
+    for (int i = 0; i < n; i++) {
+        signal_padded[i] *= conj(preamble_padded[i]);
+    }
+
+    Fft_transform(signal_padded, n, true);
+
+    double max_corr = 0;
+    int max_idx = 0;
+    for (int i = 0; i < n; i++) {
+        double corr = cabs(signal_padded[i]);
+        if (corr > max_corr) {
+            max_corr = corr;
+            max_idx = i;
+        }
+    }
+
+    free(signal_padded);
+    free(preamble_padded);
+
+    return max_idx;
+}
+
+void generate_m_sequence(uint8_t *seq, int len, uint16_t poly, int degree) {
+    uint16_t lfsr = 1;
+    for (int i = 0; i < len; i++) {
+        seq[i] = lfsr & 1;
+        uint16_t bit = 0;
+        uint16_t temp = lfsr & poly;
+        while (temp) {
+            bit ^= temp & 1;
+            temp >>= 1;
+        }
+        lfsr = (lfsr >> 1) | (bit << (degree - 1));
+    }
+}
+
 void generate_extended_preamble() { for (int i = 0; i < PREAMBLE_LENGTH; i++) { preamble_bits[i] = barker_13[i % 13]; } }
 void pll_init(pll_t *pll, double bandwidth) { *pll = (pll_t){ .kp = 4.0 * bandwidth, .ki = 4.0 * bandwidth * bandwidth }; }
 void pll_update(pll_t *pll, double phase_error) {
@@ -242,7 +296,19 @@ robust_dpsk_system_t* system_init(int buffer_length) {
     conv_encoder_init(&sys->conv_enc);
     sys->viterbi_dec = viterbi_decoder_init();
     rs_init();
-    generate_extended_preamble();
+
+    sys->preamble_len = 1023;
+    uint8_t m_seq[sys->preamble_len];
+    generate_m_sequence(m_seq, sys->preamble_len, 0x409, 10);
+    sys->preamble_samples = malloc(sys->preamble_len * SAMPLES_PER_SYMBOL * sizeof(double complex));
+    for (int i=0; i<sys->preamble_len; i++) {
+        double phase = m_seq[i] * PI;
+        for (int j=0; j<SAMPLES_PER_SYMBOL; j++) {
+            double t = (double)j / SAMPLE_RATE;
+            sys->preamble_samples[i*SAMPLES_PER_SYMBOL + j] = cexp(I * (2*PI*CARRIER_FREQ*t + phase));
+        }
+    }
+
     printf("Sistema DPSK con FEC concatenato inizializzato\n- Convoluzionale K=%d, Rate=%d/%d\n- Reed-Solomon (%d,%d), T=%d\n- Scrambling con polinomio 0x%X\n", CONV_K, CONV_RATE_NUM, CONV_RATE_DEN, RS_N, RS_K, RS_T, SCRAMBLER_POLY);
     return sys;
 }
@@ -252,7 +318,9 @@ void system_free(robust_dpsk_system_t *sys) {
         free(sys->samples); free(sys->filtered_samples); free(sys->correlation_buffer); free(sys->phase_history);
         iir_filter_free(sys->lpf_i); iir_filter_free(sys->lpf_q);
         viterbi_decoder_free(sys->viterbi_dec);
-        free(sys->fec_buffer); free(sys);
+        free(sys->fec_buffer);
+        free(sys->preamble_samples);
+        free(sys);
     }
 }
 
@@ -293,7 +361,17 @@ int encode_data_with_fec(robust_dpsk_system_t *sys, uint8_t *input_data, int inp
     return output_pos;
 }
 
+void synchronize(robust_dpsk_system_t *sys) {
+    int preamble_samples_len = sys->preamble_len * SAMPLES_PER_SYMBOL;
+    sys->sync_pos = correlate(sys->samples, sys->length, sys->preamble_samples, preamble_samples_len);
+    sys->is_synchronized = 1;
+    printf("Synchronization found at position %d\n", sys->sync_pos);
+}
+
 int decode_data_with_fec(robust_dpsk_system_t *sys, uint8_t *input_bits, int input_len, uint8_t *output_data, int max_output_len, int *corrected_blocks, int *uncorrectable_blocks) {
+    if (!sys->is_synchronized) {
+        synchronize(sys);
+    }
     int output_pos = 0;
     printf("Decoding %d bit ricevuti...\n", input_len);
     scrambler_init(&sys->scrambler, SCRAMBLER_INIT, SCRAMBLER_POLY);
@@ -552,6 +630,58 @@ int test_custom_fec_chain() {
     return success ? 0 : 1;
 }
 
+int test_synchronization() {
+    printf("\n====== Inizio Test Sincronizzazione ======\n");
+    robust_dpsk_system_t *sys = system_init(1);
+
+    // 1. Generate signal
+    int data_len = 1000;
+    int preamble_len_samples = sys->preamble_len * SAMPLES_PER_SYMBOL;
+    int signal_len = preamble_len_samples + data_len;
+    sys->samples = realloc(sys->samples, signal_len * sizeof(double complex));
+    sys->length = signal_len;
+    memcpy(sys->samples, sys->preamble_samples, preamble_len_samples * sizeof(double complex));
+    // Fill the rest with random data
+    for (int i=preamble_len_samples; i<signal_len; i++) {
+        sys->samples[i] = (double)rand() / RAND_MAX * 2.0 - 1.0;
+    }
+
+    // 2. Add noise
+    double signal_power = 0;
+    for (int i=0; i<signal_len; i++) {
+        signal_power += cabs(sys->samples[i]) * cabs(sys->samples[i]);
+    }
+    signal_power /= signal_len;
+    double noise_power = signal_power / pow(10, -20.0/10.0);
+    double noise_stddev = sqrt(noise_power / 2.0);
+    for (int i=0; i<signal_len; i++) {
+        sys->samples[i] += ( (double)rand()/RAND_MAX * 2.0 - 1.0) * noise_stddev + I * ((double)rand()/RAND_MAX * 2.0 - 1.0) * noise_stddev;
+    }
+
+    // 3. Add offset
+    int offset = rand() % 100;
+    printf("Offset: %d\n", offset);
+    memmove(&sys->samples[offset], sys->samples, (signal_len - offset) * sizeof(double complex));
+    for (int i=0; i<offset; i++) {
+        sys->samples[i] = 0;
+    }
+
+    // 4. Synchronize
+    synchronize(sys);
+
+    // 5. Verify
+    int success = (abs(sys->sync_pos - offset) < 5); // Allow for some tolerance
+
+    if (success) {
+        printf("====== Test Sincronizzazione PASSATO! ======\n");
+    } else {
+        printf("====== Test Sincronizzazione FALLITO! ======\n");
+    }
+
+    system_free(sys);
+    return success ? 0 : 1;
+}
+
 int main() {
     int fec_test_result, scrambler_test_result, conv_test_result;
 
@@ -559,6 +689,8 @@ int main() {
     conv_test_result = test_convolutional_coder();
 
     int custom_fec_test_result = test_custom_fec_chain();
+
+    int sync_test_result = test_synchronization();
 
     printf("\n====== Inizio Test Completo FEC (Scrambling, RS, Conv) ======\n");
     robust_dpsk_system_t *sys = system_init(1);
@@ -599,5 +731,5 @@ int main() {
     system_free(sys);
     fec_test_result = success ? 0 : 1;
 
-    return (fec_test_result || scrambler_test_result || conv_test_result || custom_fec_test_result);
+    return (fec_test_result || scrambler_test_result || conv_test_result || custom_fec_test_result || sync_test_result);
 }
