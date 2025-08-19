@@ -733,3 +733,13 @@ int main() {
 
     return (fec_test_result || scrambler_test_result || conv_test_result || custom_fec_test_result || sync_test_result);
 }
+
+// Implementations of missing complex arithmetic functions
+double complex __muldc3(double a, double b, double c, double d) {
+    return (a * c - b * d) + I * (a * d + b * c);
+}
+
+double complex __divdc3(double a, double b, double c, double d) {
+    double denom = c * c + d * d;
+    return ((a * c + b * d) / denom) + I * ((b * c - a * d) / denom);
+}
