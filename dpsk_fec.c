@@ -10,7 +10,7 @@
 #define SAMPLE_RATE 48000
 #define CARRIER_FREQ 480
 #define SYMBOL_DURATION 10
-#define SAMPLES_PER_SYMBOL (SAMPLE_RATE * SYMBOL_DURATION / CARRIER_FREQ)
+#define SAMPLES_PER_SYMBOL 16
 #define OVERSAMPLING 4
 #define EFFECTIVE_SAMPLES (SAMPLES_PER_SYMBOL * OVERSAMPLING)
 #define PI 3.14159265359
@@ -297,9 +297,9 @@ robust_dpsk_system_t* system_init(int buffer_length) {
     sys->viterbi_dec = viterbi_decoder_init();
     rs_init();
 
-    sys->preamble_len = 1023;
+    sys->preamble_len = 2047;
     uint8_t m_seq[sys->preamble_len];
-    generate_m_sequence(m_seq, sys->preamble_len, 0x409, 10);
+    generate_m_sequence(m_seq, sys->preamble_len, 0x805, 11);
     sys->preamble_samples = malloc(sys->preamble_len * SAMPLES_PER_SYMBOL * sizeof(double complex));
     for (int i=0; i<sys->preamble_len; i++) {
         double phase = m_seq[i] * PI;
@@ -526,14 +526,15 @@ int test_convolutional_coder() {
 
 int test_custom_fec_chain() {
     printf("\n====== Inizio Test Catena FEC Custom ======\n");
-    int num_bytes = 64; // 512 bits
-    uint8_t original_data[num_bytes];
+    robust_dpsk_system_t *sys = system_init(1);
+    int num_bytes = 10; // 80 bits
+    uint8_t* original_data = malloc(num_bytes * sizeof(uint8_t));
     for (int i = 0; i < num_bytes; i++) {
         original_data[i] = rand() % 256;
     }
 
     // 1. RS encode
-    uint8_t rs_codeword[num_bytes + NPAR];
+    uint8_t* rs_codeword = malloc((num_bytes + NPAR) * sizeof(uint8_t));
     rs_encode(original_data, num_bytes, rs_codeword);
 
     // 2. Convolutional encode
@@ -542,8 +543,7 @@ int test_custom_fec_chain() {
     int conv_input_len_bits = (num_bytes + NPAR) * 8;
     int conv_output_len_bits_unpadded = (conv_input_len_bits + VITERBI_TRACEBACK - 1) * 2;
     int conv_output_len_bits = (conv_output_len_bits_unpadded + 7) & ~7; // Align to 8 bits
-    uint8_t conv_output_bits[conv_output_len_bits];
-    memset(conv_output_bits, 0, conv_output_len_bits);
+    uint8_t* conv_output_bits = calloc(conv_output_len_bits, sizeof(uint8_t));
 
     for (int i = 0; i < (num_bytes + NPAR); i++) {
         for (int bit = 0; bit < 8; bit++) {
@@ -559,7 +559,7 @@ int test_custom_fec_chain() {
     scrambler_t scrambler;
     scrambler_init(&scrambler, SCRAMBLER_INIT, SCRAMBLER_POLY);
     int scrambled_len_bytes = conv_output_len_bits / 8;
-    uint8_t scrambled_data[scrambled_len_bytes];
+    uint8_t* scrambled_data = malloc(scrambled_len_bytes * sizeof(uint8_t));
     for (int i = 0; i < scrambled_len_bytes; i++) {
         uint8_t byte = 0;
         for (int bit = 0; bit < 8; bit++) {
@@ -568,42 +568,137 @@ int test_custom_fec_chain() {
         scrambled_data[i] = scramble_byte(&scrambler, byte);
     }
 
-    // 4. Introduce errors
-    int num_errors = 20;
-    printf("Introdotti %d errori di bit.\n", num_errors);
-    for (int i = 0; i < num_errors; i++) {
-        int byte_loc = rand() % scrambled_len_bytes;
-        int bit_loc = rand() % 8;
-        scrambled_data[byte_loc] ^= (1 << bit_loc);
+    // Modulate the scrambled data
+    int preamble_len_samples = sys->preamble_len * SAMPLES_PER_SYMBOL;
+    int modulated_len_samples = preamble_len_samples + scrambled_len_bytes * 8 * SAMPLES_PER_SYMBOL;
+    double complex* modulated_signal = malloc(modulated_len_samples * sizeof(double complex));
+    memcpy(modulated_signal, sys->preamble_samples, preamble_len_samples * sizeof(double complex));
+    double current_phase = 0;
+    for (int i=0; i<scrambled_len_bytes; i++) {
+        for (int bit=0; bit<8; bit++) {
+            uint8_t a_bit = (scrambled_data[i] >> bit) & 1;
+            if (a_bit == 1) {
+                current_phase += PI;
+                if (current_phase > PI) current_phase -= 2*PI;
+            }
+            for (int j=0; j<SAMPLES_PER_SYMBOL; j++) {
+                double t = (double)j / SAMPLE_RATE;
+                modulated_signal[(i*8+bit)*SAMPLES_PER_SYMBOL + j] = cexp(I * (2*PI*CARRIER_FREQ*t + current_phase));
+            }
+        }
     }
 
-    // 5. Descramble
+    // Add noise
+    double signal_power = 0;
+    for (int i=0; i<modulated_len_samples; i++) {
+        signal_power += cabs(modulated_signal[i]) * cabs(modulated_signal[i]);
+    }
+    signal_power /= modulated_len_samples;
+    double noise_power = signal_power / pow(10, -20.0/10.0);
+    double noise_stddev = sqrt(noise_power / 2.0);
+    for (int i=0; i<modulated_len_samples; i++) {
+        modulated_signal[i] += ( (double)rand()/RAND_MAX * 2.0 - 1.0) * noise_stddev + I * ((double)rand()/RAND_MAX * 2.0 - 1.0) * noise_stddev;
+    }
+
+    // Add offset
+    int offset = rand() % 100;
+    printf("Offset: %d\n", offset);
+    memmove(&modulated_signal[offset], modulated_signal, (modulated_len_samples - offset) * sizeof(double complex));
+    for (int i=0; i<offset; i++) {
+        modulated_signal[i] = 0;
+    }
+
+    // 6. Synchronization
+    sys->samples = realloc(sys->samples, modulated_len_samples * sizeof(double complex));
+    sys->length = modulated_len_samples;
+    memcpy(sys->samples, modulated_signal, modulated_len_samples * sizeof(double complex));
+    synchronize(sys);
+
+    // Filter the received signal
+    for (int i=0; i<sys->length; i++) {
+        double real = creal(sys->samples[i]);
+        double imag = cimag(sys->samples[i]);
+        real = iir_filter_process(sys->lpf_i, real);
+        imag = iir_filter_process(sys->lpf_q, imag);
+        sys->samples[i] = real + I * imag;
+    }
+
+    // 7. Demodulation
+    pll_t pll;
+    pll_init(&pll, PLL_BANDWIDTH);
+
+    // Lock PLL on preamble
+    uint8_t m_seq[sys->preamble_len];
+    generate_m_sequence(m_seq, sys->preamble_len, 0x409, 10);
+    for (int i=0; i<sys->preamble_len; i++) {
+        double complex symbol_sum = 0;
+        for (int j=0; j<SAMPLES_PER_SYMBOL; j++) {
+            symbol_sum += sys->samples[sys->sync_pos + i*SAMPLES_PER_SYMBOL + j];
+        }
+        double received_phase = carg(symbol_sum);
+        double expected_phase = m_seq[i] * PI;
+        double phase_error = expected_phase - received_phase;
+        while (phase_error > PI) phase_error -= 2*PI;
+        while (phase_error < -PI) phase_error += 2*PI;
+        pll_update(&pll, phase_error);
+    }
+
+    int num_demodulated_bytes = scrambled_len_bytes;
+    uint8_t* demodulated_bytes = malloc(num_demodulated_bytes * sizeof(uint8_t));
+    double prev_phase = 0;
+    for (int i=0; i<num_demodulated_bytes; i++) {
+        uint8_t byte = 0;
+        for (int bit=0; bit<8; bit++) {
+            double complex symbol_sum = 0;
+            for (int j=0; j<SAMPLES_PER_SYMBOL; j++) {
+                symbol_sum += sys->samples[sys->sync_pos + (sys->preamble_len + i*8+bit)*SAMPLES_PER_SYMBOL + j] * cexp(-I * pll.phase);
+            }
+            double current_phase = carg(symbol_sum);
+            double phase_diff = current_phase - prev_phase;
+            if (phase_diff > PI) phase_diff -= 2*PI;
+            if (phase_diff < -PI) phase_diff += 2*PI;
+
+            uint8_t demod_bit = 0;
+            if (fabs(phase_diff - PI) < PI/2 || fabs(phase_diff + PI) < PI/2) {
+                demod_bit = 1;
+            }
+            byte |= demod_bit << bit;
+            prev_phase = current_phase;
+            pll_update(&pll, phase_diff - (demod_bit * PI));
+        }
+        demodulated_bytes[i] = byte;
+    }
+
+    // 8. Descramble
     scrambler_init(&scrambler, SCRAMBLER_INIT, SCRAMBLER_POLY);
-    uint8_t descrambled_data[scrambled_len_bytes];
-    for (int i = 0; i < scrambled_len_bytes; i++) {
-        descrambled_data[i] = scramble_byte(&scrambler, scrambled_data[i]);
+    uint8_t* descrambled_data = malloc(num_demodulated_bytes * sizeof(uint8_t));
+    for (int i = 0; i < num_demodulated_bytes; i++) {
+        descrambled_data[i] = scramble_byte(&scrambler, demodulated_bytes[i]);
     }
 
-    // 6. Convolutional decode
+    // 9. Viterbi decode
     viterbi_decoder_t *viterbi_dec = viterbi_decoder_init();
     int num_columns = conv_output_len_bits / 2;
     uint16_t *trellis = calloc(CONV_STATES * num_columns, sizeof(uint16_t));
-    uint8_t conv_decoded_bits[num_columns];
-    for (int i = 0; i < num_columns; i++) {
-        uint8_t received_bits[2];
-        int bit_idx0 = i * 2;
-        int bit_idx1 = i * 2 + 1;
-        received_bits[0] = (descrambled_data[bit_idx0 / 8] >> (bit_idx0 % 8)) & 1;
-        received_bits[1] = (descrambled_data[bit_idx1 / 8] >> (bit_idx1 % 8)) & 1;
+    uint8_t* conv_decoded_bits = malloc(num_columns * sizeof(uint8_t));
 
-        viterbi_update_trellis(viterbi_dec, received_bits, &trellis[i * CONV_STATES]);
+    uint8_t* viterbi_input_bits = malloc(num_columns*2 * sizeof(uint8_t));
+    for (int i=0; i<num_demodulated_bytes; i++) {
+        for (int bit=0; bit<8; bit++) {
+            viterbi_input_bits[i*8+bit] = (descrambled_data[i] >> bit) & 1;
+        }
+    }
+
+    for (int i = 0; i < num_columns; i++) {
+        viterbi_update_trellis(viterbi_dec, &viterbi_input_bits[i * 2], &trellis[i * CONV_STATES]);
     }
     viterbi_traceback(viterbi_dec, trellis, num_columns, conv_decoded_bits);
     free(trellis);
     viterbi_decoder_free(viterbi_dec);
+    free(conv_output_bits);
 
     // 7. RS decode
-    uint8_t rs_decoded_codeword[num_bytes + NPAR];
+    uint8_t* rs_decoded_codeword = malloc((num_bytes + NPAR) * sizeof(uint8_t));
     for (int i = 0; i < (num_bytes + NPAR); i++) {
         uint8_t byte = 0;
         for (int bit = 0; bit < 8; bit++) {
@@ -627,6 +722,18 @@ int test_custom_fec_chain() {
     } else {
         printf("====== Test Catena FEC Custom FALLITO! ======\n");
     }
+
+    free(original_data);
+    free(rs_codeword);
+    free(scrambled_data);
+    free(modulated_signal);
+    free(demodulated_bytes);
+    free(descrambled_data);
+    free(conv_decoded_bits);
+    free(viterbi_input_bits);
+    free(rs_decoded_codeword);
+    system_free(sys);
+
     return success ? 0 : 1;
 }
 
