@@ -1,0 +1,4 @@
+# Escludi i file binari compilati
+encoder_test
+*.exe
+*.o
