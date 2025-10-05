@@ -1,36 +1,35 @@
 #include "convolutional_encoder.h"
-#include <iostream>
-#include <string>
+#include <cstdio> // Per printf
+#include <string> // Mantenuto per std::string nei nomi dei vettori
 
 // Funzione di supporto per stampare un array di bit
 void print_array(const std::string& name, const int* arr, int size, int max_elements = 40)
 {
-    std::cout << name << " (len " << size << "): ";
+    printf("%s (len %d): ", name.c_str(), size);
     for (int i = 0; i < size && i < max_elements; ++i)
     {
-        std::cout << arr[i];
+        printf("%d", arr[i]);
     }
     if (size > max_elements)
     {
-        std::cout << "...";
+        printf("...");
     }
-    std::cout << std::endl;
+    printf("\n");
 }
 
 // Funzione di supporto per stampare un array di float
 void print_soft_array(const std::string& name, const float* arr, int size, int max_elements = 40)
 {
-    std::cout << name << " (len " << size << "): ";
+    printf("%s (len %d): ", name.c_str(), size);
     for (int i = 0; i < size && i < max_elements; ++i)
     {
-        std::cout.precision(2);
-        std::cout << std::fixed << arr[i] << " ";
+        printf("%.2f ", arr[i]);
     }
     if (size > max_elements)
     {
-        std::cout << "...";
+        printf("...");
     }
-    std::cout << std::endl;
+    printf("\n");
 }
 
 // Funzione per confrontare due array
@@ -69,13 +68,24 @@ int main()
         received_soft_bits[i] = 1.0f - 2.0f * encoded_bits[i];
     }
 
-    // Introduciamo un errore "soft": un valore viene corrotto ma non invertito completamente
-    int error_position = 5;
-    if (error_position < encoded_size)
+    // Introduciamo un numero maggiore di errori
+    int error_positions[] = {5, 12, 25, 38};
+    int num_errors = sizeof(error_positions) / sizeof(int);
+    printf("\n-> Introduzione di %d errori soft nelle posizioni:", num_errors);
+    for (int i = 0; i < num_errors; ++i)
     {
-        std::cout << "\n-> Errore soft introdotto al simbolo " << error_position << std::endl;
-        // Corrompiamo il valore, rendendolo ambiguo (es. da -1.0 a +0.2)
-        received_soft_bits[error_position] = 0.2f;
+        printf(" %d", error_positions[i]);
+    }
+    printf("\n");
+
+    for (int i = 0; i < num_errors; ++i)
+    {
+        int pos = error_positions[i];
+        if (pos < encoded_size)
+        {
+            // Corrompiamo il valore, rendendolo ambiguo
+            received_soft_bits[pos] = 0.2f;
+        }
     }
     print_soft_array("Simboli soft ricevuti: ", received_soft_bits, encoded_size);
 
@@ -85,18 +95,18 @@ int main()
     print_array("Messaggio decodificato:", decoded_bits, message_size);
 
     // --- 4. Verifica ---
-    std::cout << "\n----------------------------------------" << std::endl;
+    printf("\n----------------------------------------\n");
     if (compare_arrays(message_bits, decoded_bits, message_size))
     {
-        std::cout << "RISULTATO: Successo!" << std::endl;
-        std::cout << "Il messaggio e' stato decodificato correttamente." << std::endl;
+        printf("RISULTATO: Successo!\n");
+        printf("Il messaggio e' stato decodificato correttamente nonostante i %d errori.\n", num_errors);
     }
     else
     {
-        std::cout << "RISULTATO: Fallimento." << std::endl;
-        std::cout << "Il messaggio decodificato non corrisponde all'originale." << std::endl;
+        printf("RISULTATO: Fallimento.\n");
+        printf("Il messaggio decodificato non corrisponde all'originale.\n");
     }
-    std::cout << "----------------------------------------" << std::endl;
+    printf("----------------------------------------\n");
 
     return 0;
 }
